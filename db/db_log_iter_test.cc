@@ -16,10 +16,12 @@
 #include <thread>
 
 #include "db/db_test_util.h"
+#include "db/write_batch_internal.h"
 #include "env/mock_env.h"
 #include "port/stack_trace.h"
 #include "util/atomic.h"
 #include "util/defer.h"
+#include "util/xxhash.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -29,14 +31,19 @@ class DBTestXactLogIterator : public DBTestBase {
       : DBTestBase("db_log_iter_test", /*env_do_fsync=*/true) {}
 
   std::unique_ptr<TransactionLogIterator> OpenTransactionLogIter(
-      const SequenceNumber seq, const bool include_wal_record_checksum = false) {
+      const SequenceNumber seq) {
     std::unique_ptr<TransactionLogIterator> iter;
-    TransactionLogIterator::ReadOptions read_options;
-    read_options.include_wal_record_checksum_ = include_wal_record_checksum;
-    Status status = dbfull()->GetUpdatesSince(seq, &iter, read_options);
+    Status status = dbfull()->GetUpdatesSince(seq, &iter);
     EXPECT_OK(status);
     EXPECT_TRUE(iter->Valid());
     return iter;
+  }
+
+  TransactionLogPositionV1 CurrentPosition(TransactionLogIterator* iter) {
+    TransactionLogPositionV1 position;
+    EXPECT_OK(GetTransactionLogIteratorBatchPositionV1(
+        iter, &position, /*include_checksum=*/true));
+    return position;
   }
 };
 
@@ -343,30 +350,65 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorBlobs) {
 TEST_F(DBTestXactLogIterator,
        TransactionLogIteratorLogDataOnlyTailAndWalPosition) {
   Options options = OptionsForLogIterTest();
+#ifdef ZSTD
+  options.wal_compression = kZSTD;
+#endif
   DestroyAndReopen(options);
   ASSERT_OK(Put("key1", "value1"));
 
-  auto default_iter = OpenTransactionLogIter(0);
-  ASSERT_EQ(default_iter->GetBatch().wal_record_checksum, 0U);
-
-  auto iter = OpenTransactionLogIter(0, true);
+  auto iter = OpenTransactionLogIter(0);
+  const TransactionLogPositionV1 initial_position =
+      CurrentPosition(iter.get());
+  TransactionLogPositionV1 repeated_initial_position;
+  ASSERT_OK(GetTransactionLogIteratorBatchPositionV1(
+      iter.get(), &repeated_initial_position, /*include_checksum=*/false));
+  ASSERT_EQ(repeated_initial_position.wal_file_number,
+            initial_position.wal_file_number);
+  ASSERT_EQ(repeated_initial_position.wal_record_offset,
+            initial_position.wal_record_offset);
+  ASSERT_EQ(repeated_initial_position.wal_record_end,
+            initial_position.wal_record_end);
+  ASSERT_EQ(repeated_initial_position.wal_record_checksum, 0U);
+  ASSERT_TRUE(GetTransactionLogIteratorBatchPositionV1(
+                  nullptr, &repeated_initial_position,
+                  /*include_checksum=*/true)
+                  .IsInvalidArgument());
+  ASSERT_TRUE(GetTransactionLogIteratorBatchPositionV1(
+                  iter.get(), nullptr, /*include_checksum=*/true)
+                  .IsInvalidArgument());
   BatchResult initial = iter->GetBatch();
   ASSERT_EQ(initial.writeBatchPtr->Count(), 1U);
+  const Slice initial_contents =
+      WriteBatchInternal::Contents(initial.writeBatchPtr.get());
+  ASSERT_EQ(initial_position.wal_record_checksum,
+            XXH3_64bits(initial_contents.data(), initial_contents.size()));
+  TransactionLogPositionV1 moved_out_position;
+  ASSERT_TRUE(GetTransactionLogIteratorBatchPositionV1(
+                  iter.get(), &moved_out_position,
+                  /*include_checksum=*/true)
+                  .IsInvalidArgument());
   iter->Next();
   ASSERT_FALSE(iter->Valid());
   ASSERT_OK(iter->status());
 
+  Random random(301);
+  const std::string first_log_payload = random.RandomString(128 * 1024);
   WriteBatch first_log_data;
-  ASSERT_OK(first_log_data.PutLogData(Slice("log-data-1")));
+  ASSERT_OK(first_log_data.PutLogData(Slice(first_log_payload)));
   ASSERT_OK(dbfull()->Write(WriteOptions(), &first_log_data));
 
   iter->Next();
   ASSERT_TRUE(iter->Valid());
+  const TransactionLogPositionV1 first_position = CurrentPosition(iter.get());
   BatchResult first = iter->GetBatch();
   ASSERT_EQ(first.sequence, 2U);
   ASSERT_EQ(first.writeBatchPtr->Count(), 0U);
-  ASSERT_GT(first.wal_file_number, 0U);
-  ASSERT_LT(first.wal_record_offset, first.wal_record_end);
+  const Slice first_contents =
+      WriteBatchInternal::Contents(first.writeBatchPtr.get());
+  ASSERT_EQ(first_position.wal_record_checksum,
+            XXH3_64bits(first_contents.data(), first_contents.size()));
+  ASSERT_GT(first_position.wal_file_number, 0U);
+  ASSERT_LT(first_position.wal_record_offset, first_position.wal_record_end);
 
   iter->Next();
   ASSERT_FALSE(iter->Valid());
@@ -378,58 +420,65 @@ TEST_F(DBTestXactLogIterator,
 
   iter->Next();
   ASSERT_TRUE(iter->Valid());
+  const TransactionLogPositionV1 second_position =
+      CurrentPosition(iter.get());
   BatchResult second = iter->GetBatch();
   ASSERT_EQ(second.sequence, 2U);
   ASSERT_EQ(second.writeBatchPtr->Count(), 0U);
-  ASSERT_EQ(first.wal_file_number, second.wal_file_number);
-  ASSERT_LT(first.wal_record_offset, second.wal_record_offset);
-  ASSERT_LE(first.wal_record_end, second.wal_record_offset);
-  ASSERT_NE(first.wal_record_checksum, second.wal_record_checksum);
-
-  const uint64_t first_file_number = first.wal_file_number;
-  const uint64_t first_offset = first.wal_record_offset;
-  const uint64_t first_end = first.wal_record_end;
-  const uint64_t first_checksum = first.wal_record_checksum;
-  const uint64_t second_file_number = second.wal_file_number;
-  const uint64_t second_offset = second.wal_record_offset;
-  const uint64_t second_end = second.wal_record_end;
-  const uint64_t second_checksum = second.wal_record_checksum;
-
-  BatchResult move_constructed(std::move(first));
-  ASSERT_EQ(move_constructed.wal_file_number, first_file_number);
-  ASSERT_EQ(move_constructed.wal_record_offset, first_offset);
-  ASSERT_EQ(move_constructed.wal_record_end, first_end);
-  ASSERT_EQ(move_constructed.wal_record_checksum, first_checksum);
-
-  BatchResult moved;
-  moved = std::move(second);
-  ASSERT_EQ(moved.wal_file_number, second_file_number);
-  ASSERT_EQ(moved.wal_record_offset, second_offset);
-  ASSERT_EQ(moved.wal_record_end, second_end);
-  ASSERT_EQ(moved.wal_record_checksum, second_checksum);
+  ASSERT_EQ(first_position.wal_file_number, second_position.wal_file_number);
+  ASSERT_LT(first_position.wal_record_offset,
+            second_position.wal_record_offset);
+  ASSERT_LE(first_position.wal_record_end,
+            second_position.wal_record_offset);
+  ASSERT_NE(first_position.wal_record_checksum,
+            second_position.wal_record_checksum);
 
   iter->Next();
   ASSERT_FALSE(iter->Valid());
   ASSERT_OK(iter->status());
   ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 1U);
 
-  auto replay = OpenTransactionLogIter(0, true);
+  auto replay = OpenTransactionLogIter(0);
+  const TransactionLogPositionV1 replay_initial_position =
+      CurrentPosition(replay.get());
+  ASSERT_EQ(replay_initial_position.wal_file_number,
+            initial_position.wal_file_number);
+  ASSERT_EQ(replay_initial_position.wal_record_offset,
+            initial_position.wal_record_offset);
+  ASSERT_EQ(replay_initial_position.wal_record_end,
+            initial_position.wal_record_end);
+  ASSERT_EQ(replay_initial_position.wal_record_checksum,
+            initial_position.wal_record_checksum);
   ASSERT_EQ(replay->GetBatch().writeBatchPtr->Count(), 1U);
   replay->Next();
   ASSERT_TRUE(replay->Valid());
+  const TransactionLogPositionV1 replay_first_position =
+      CurrentPosition(replay.get());
   BatchResult replay_first = replay->GetBatch();
-  ASSERT_EQ(replay_first.wal_file_number, first_file_number);
-  ASSERT_EQ(replay_first.wal_record_offset, first_offset);
-  ASSERT_EQ(replay_first.wal_record_end, first_end);
-  ASSERT_EQ(replay_first.wal_record_checksum, first_checksum);
+  ASSERT_EQ(replay_first_position.wal_file_number,
+            first_position.wal_file_number);
+  ASSERT_EQ(replay_first_position.wal_record_offset,
+            first_position.wal_record_offset);
+  ASSERT_EQ(replay_first_position.wal_record_end,
+            first_position.wal_record_end);
+  ASSERT_EQ(replay_first_position.wal_record_checksum,
+            first_position.wal_record_checksum);
+  ASSERT_EQ(replay_first.sequence, first.sequence);
 
   replay->Next();
   ASSERT_TRUE(replay->Valid());
+  const TransactionLogPositionV1 replay_second_position =
+      CurrentPosition(replay.get());
   BatchResult replay_second = replay->GetBatch();
-  ASSERT_EQ(replay_second.wal_file_number, second_file_number);
-  ASSERT_EQ(replay_second.wal_record_offset, second_offset);
-  ASSERT_EQ(replay_second.wal_record_end, second_end);
-  ASSERT_EQ(replay_second.wal_record_checksum, second_checksum);
+  ASSERT_EQ(replay_second_position.wal_file_number,
+            second_position.wal_file_number);
+  ASSERT_EQ(replay_second_position.wal_record_offset,
+            second_position.wal_record_offset);
+  ASSERT_EQ(replay_second_position.wal_record_end,
+            second_position.wal_record_end);
+  ASSERT_EQ(replay_second_position.wal_record_checksum,
+            second_position.wal_record_checksum);
+  ASSERT_EQ(replay_second.sequence, second.sequence);
   replay->Next();
   ASSERT_FALSE(replay->Valid());
   ASSERT_OK(replay->status());
@@ -448,19 +497,24 @@ TEST_F(DBTestXactLogIterator,
   ASSERT_OK(dbfull()->Write(WriteOptions(), &second_log_data));
   ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 0U);
 
-  auto iter = OpenTransactionLogIter(0, true);
+  auto iter = OpenTransactionLogIter(0);
+  const TransactionLogPositionV1 first_position = CurrentPosition(iter.get());
   BatchResult first = iter->GetBatch();
   ASSERT_EQ(first.sequence, 1U);
   ASSERT_EQ(first.writeBatchPtr->Count(), 0U);
 
   iter->Next();
   ASSERT_TRUE(iter->Valid());
+  const TransactionLogPositionV1 second_position =
+      CurrentPosition(iter.get());
   BatchResult second = iter->GetBatch();
   ASSERT_EQ(second.sequence, 1U);
   ASSERT_EQ(second.writeBatchPtr->Count(), 0U);
-  ASSERT_EQ(first.wal_file_number, second.wal_file_number);
-  ASSERT_LT(first.wal_record_offset, second.wal_record_offset);
-  ASSERT_NE(first.wal_record_checksum, second.wal_record_checksum);
+  ASSERT_EQ(first_position.wal_file_number, second_position.wal_file_number);
+  ASSERT_LT(first_position.wal_record_offset,
+            second_position.wal_record_offset);
+  ASSERT_NE(first_position.wal_record_checksum,
+            second_position.wal_record_checksum);
 
   iter->Next();
   ASSERT_FALSE(iter->Valid());

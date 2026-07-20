@@ -71,6 +71,9 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
 
   BatchResult GetBatch() override;
 
+  Status GetBatchPosition(TransactionLogPositionV1* position,
+                          bool include_checksum) const;
+
  private:
   const std::string& dir_;
   const ImmutableDBOptions* options_;
@@ -112,13 +115,11 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   uint64_t current_batch_wal_file_number_;
   uint64_t current_batch_wal_record_offset_;
   uint64_t current_batch_wal_record_end_;
-  uint64_t current_batch_wal_record_checksum_;
 
   // Metadata for the record most recently returned by RestrictedRead().
   uint64_t current_record_wal_file_number_;
   uint64_t current_record_wal_record_offset_;
   uint64_t current_record_wal_record_end_;
-  uint64_t current_record_wal_record_checksum_;
 
   // A complete consuming record can reach the WAL before its ending sequence
   // is published. Keep it here so a later Next() can return it without either
@@ -128,7 +129,6 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   uint64_t unpublished_record_wal_file_number_;
   uint64_t unpublished_record_wal_record_offset_;
   uint64_t unpublished_record_wal_record_end_;
-  uint64_t unpublished_record_wal_record_checksum_;
 
   // Reads the next complete transaction-log record. Zero-count records are
   // immediately visible. Consuming records are returned only after their

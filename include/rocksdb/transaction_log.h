@@ -62,21 +62,6 @@ using LogFile = WalFile;
 
 struct BatchResult {
   SequenceNumber sequence = 0;
-
-  // The WAL file number containing this batch. Together with
-  // wal_record_offset, this identifies the batch while the WAL is retained.
-  uint64_t wal_file_number = 0;
-
-  // The physical byte offset of the first fragment of this logical WAL record.
-  uint64_t wal_record_offset = 0;
-
-  // The first physical byte offset after this logical WAL record.
-  uint64_t wal_record_end = 0;
-
-  // XXH3 checksum of the logical WAL record contents, or zero when
-  // ReadOptions::include_wal_record_checksum_ is false.
-  uint64_t wal_record_checksum = 0;
-
   std::unique_ptr<WriteBatch> writeBatchPtr;
 
   // Add empty __ctor and __dtor for the rule of five
@@ -90,27 +75,29 @@ struct BatchResult {
 
   BatchResult& operator=(const BatchResult&) = delete;
 
-  BatchResult(BatchResult&& bResult) noexcept
-      : sequence(bResult.sequence),
-        wal_file_number(bResult.wal_file_number),
-        wal_record_offset(bResult.wal_record_offset),
-        wal_record_end(bResult.wal_record_end),
-        wal_record_checksum(bResult.wal_record_checksum),
+  BatchResult(BatchResult&& bResult)
+      : sequence(std::move(bResult.sequence)),
         writeBatchPtr(std::move(bResult.writeBatchPtr)) {}
 
-  BatchResult& operator=(BatchResult&& bResult) noexcept {
-    if (this == &bResult) {
-      return *this;
-    }
-    sequence = bResult.sequence;
-    wal_file_number = bResult.wal_file_number;
-    wal_record_offset = bResult.wal_record_offset;
-    wal_record_end = bResult.wal_record_end;
-    wal_record_checksum = bResult.wal_record_checksum;
+  BatchResult& operator=(BatchResult&& bResult) {
+    sequence = std::move(bResult.sequence);
     writeBatchPtr = std::move(bResult.writeBatchPtr);
     return *this;
   }
 };
+
+// Exact physical position of a WriteBatch returned by a transaction log
+// iterator. The WAL file number and record offset identify the batch while its
+// WAL is retained. wal_record_end is the first physical byte after the logical
+// WAL record. wal_record_checksum is the XXH3 checksum of the logical record
+// contents when requested by GetTransactionLogIteratorBatchPositionV1().
+struct TransactionLogPositionV1 {
+  uint64_t wal_file_number = 0;
+  uint64_t wal_record_offset = 0;
+  uint64_t wal_record_end = 0;
+  uint64_t wal_record_checksum = 0;
+};
+static_assert(sizeof(TransactionLogPositionV1) == 4 * sizeof(uint64_t));
 
 // A TransactionLogIterator is used to iterate over the transactions in a db.
 // One run of the iterator is continuous, i.e. the iterator will stop at the
@@ -146,16 +133,22 @@ class TransactionLogIterator {
     // Default: true
     bool verify_checksums_;
 
-    // If true, calculate and populate BatchResult::wal_record_checksum.
-    // Default: false
-    bool include_wal_record_checksum_;
-
-    ReadOptions()
-        : verify_checksums_(true), include_wal_record_checksum_(false) {}
+    ReadOptions() : verify_checksums_(true) {}
 
     explicit ReadOptions(bool verify_checksums)
-        : verify_checksums_(verify_checksums),
-          include_wal_record_checksum_(false) {}
+        : verify_checksums_(verify_checksums) {}
   };
 };
+
+// Returns the exact WAL position for the iterator's current batch without
+// consuming it. wal_record_checksum is zero unless include_checksum is true.
+//
+// This extension supports iterators created by RocksDB's built-in DB
+// implementation. Passing a custom TransactionLogIterator is unsupported.
+//
+// REQUIRES: Valid() is true, status() is OK, position is not null, and this is
+// called before GetBatch(), which moves the current WriteBatch out.
+Status GetTransactionLogIteratorBatchPositionV1(
+    const TransactionLogIterator* iterator,
+    TransactionLogPositionV1* position, bool include_checksum);
 }  // namespace ROCKSDB_NAMESPACE
