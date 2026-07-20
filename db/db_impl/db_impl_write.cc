@@ -768,6 +768,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                                wal_context.need_wal_sync,
                                wal_context.need_wal_dir_sync, last_sequence + 1,
                                *wal_context.wal_file_number_size);
+        TEST_SYNC_POINT("DBImpl::WriteImpl:AfterWriteWAL");
       }
     } else {
       if (status.ok() && !write_options.disableWAL) {

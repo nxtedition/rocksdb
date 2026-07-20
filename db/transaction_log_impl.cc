@@ -9,6 +9,7 @@
 
 #include "db/write_batch_internal.h"
 #include "file/sequence_file_reader.h"
+#include "util/coding.h"
 #include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -32,7 +33,20 @@ TransactionLogIteratorImpl::TransactionLogIteratorImpl(
       is_valid_(false),
       current_file_index_(0),
       current_batch_seq_(0),
-      current_last_seq_(0) {
+      current_last_seq_(0),
+      current_batch_wal_file_number_(0),
+      current_batch_wal_record_offset_(0),
+      current_batch_wal_record_end_(0),
+      current_batch_wal_record_checksum_(0),
+      current_record_wal_file_number_(0),
+      current_record_wal_record_offset_(0),
+      current_record_wal_record_end_(0),
+      current_record_wal_record_checksum_(0),
+      has_unpublished_record_(false),
+      unpublished_record_wal_file_number_(0),
+      unpublished_record_wal_record_offset_(0),
+      unpublished_record_wal_record_end_(0),
+      unpublished_record_wal_record_checksum_(0) {
   assert(files_ != nullptr);
   assert(versions_ != nullptr);
   assert(!seq_per_batch_);
@@ -75,6 +89,10 @@ BatchResult TransactionLogIteratorImpl::GetBatch() {
   assert(is_valid_);  //  cannot call in a non valid state.
   BatchResult result;
   result.sequence = current_batch_seq_;
+  result.wal_file_number = current_batch_wal_file_number_;
+  result.wal_record_offset = current_batch_wal_record_offset_;
+  result.wal_record_end = current_batch_wal_record_end_;
+  result.wal_record_checksum = current_batch_wal_record_checksum_;
   result.writeBatchPtr = std::move(current_batch_);
   return result;
 }
@@ -83,12 +101,65 @@ Status TransactionLogIteratorImpl::status() { return current_status_; }
 
 bool TransactionLogIteratorImpl::Valid() { return started_ && is_valid_; }
 
+bool TransactionLogIteratorImpl::IsRecordPublished(const Slice& record) const {
+  if (record.size() < WriteBatchInternal::kHeader) {
+    // Let the caller preserve the existing corruption-reporting behavior.
+    return true;
+  }
+
+  const uint64_t count = DecodeFixed32(record.data() + 8);
+  if (count == 0) {
+    return true;
+  }
+
+  const SequenceNumber sequence = DecodeFixed64(record.data());
+  const SequenceNumber published_sequence = versions_->LastSequence();
+  return sequence <= published_sequence &&
+         count - 1 <= published_sequence - sequence;
+}
+
 bool TransactionLogIteratorImpl::RestrictedRead(Slice* record) {
-  // Don't read if no more complete entries to read from logs
-  if (current_last_seq_ >= versions_->LastSequence()) {
+  if (has_unpublished_record_) {
+    Slice unpublished_record(unpublished_record_);
+    if (!IsRecordPublished(unpublished_record)) {
+      return false;
+    }
+
+    scratch_ = std::move(unpublished_record_);
+    has_unpublished_record_ = false;
+    *record = Slice(scratch_);
+    current_record_wal_file_number_ = unpublished_record_wal_file_number_;
+    current_record_wal_record_offset_ = unpublished_record_wal_record_offset_;
+    current_record_wal_record_end_ = unpublished_record_wal_record_end_;
+    current_record_wal_record_checksum_ =
+        unpublished_record_wal_record_checksum_;
+    return true;
+  }
+
+  uint64_t record_checksum = 0;
+  if (!current_log_reader_->ReadRecord(
+          record, &scratch_, WALRecoveryMode::kTolerateCorruptedTailRecords,
+          &record_checksum)) {
     return false;
   }
-  return current_log_reader_->ReadRecord(record, &scratch_);
+
+  current_record_wal_file_number_ = current_log_reader_->GetLogNumber();
+  current_record_wal_record_offset_ = current_log_reader_->LastRecordOffset();
+  current_record_wal_record_end_ = current_log_reader_->LastRecordEnd();
+  current_record_wal_record_checksum_ = record_checksum;
+
+  if (!IsRecordPublished(*record)) {
+    unpublished_record_.assign(record->data(), record->size());
+    has_unpublished_record_ = true;
+    unpublished_record_wal_file_number_ = current_record_wal_file_number_;
+    unpublished_record_wal_record_offset_ = current_record_wal_record_offset_;
+    unpublished_record_wal_record_end_ = current_record_wal_record_end_;
+    unpublished_record_wal_record_checksum_ =
+        current_record_wal_record_checksum_;
+    return false;
+  }
+
+  return true;
 }
 
 void TransactionLogIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
@@ -112,12 +183,14 @@ void TransactionLogIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
   } else if (!current_status_.ok()) {
     return;
   }
-  Status s =
-      OpenLogReader(files_->at(static_cast<size_t>(start_file_index)).get());
-  if (!s.ok()) {
-    current_status_ = s;
-    reporter_.Info(current_status_.ToString().c_str());
-    return;
+  if (!has_unpublished_record_) {
+    Status s =
+        OpenLogReader(files_->at(static_cast<size_t>(start_file_index)).get());
+    if (!s.ok()) {
+      current_status_ = s;
+      reporter_.Info(current_status_.ToString().c_str());
+      return;
+    }
   }
   while (RestrictedRead(&record)) {
     if (record.size() < WriteBatchInternal::kHeader) {
@@ -144,6 +217,11 @@ void TransactionLogIteratorImpl::SeekToStartSequence(uint64_t start_file_index,
     } else {
       is_valid_ = false;
     }
+  }
+
+  if (has_unpublished_record_) {
+    current_status_ = Status::OK();
+    return;
   }
 
   // Could not find start sequence in first file. Normally this must be the
@@ -201,6 +279,15 @@ void TransactionLogIteratorImpl::NextImpl(bool internal) {
         }
         return;
       }
+    }
+
+    if (has_unpublished_record_) {
+      // A complete record has reached the WAL, but its sequence range is not
+      // published yet. Keep the iterator resumable at this exact reader
+      // position instead of opening another WAL or reporting a false gap.
+      is_valid_ = false;
+      current_status_ = Status::OK();
+      return;
     }
 
     // Open the next file
@@ -276,6 +363,10 @@ void TransactionLogIteratorImpl::UpdateCurrentWriteBatch(const Slice& record) {
   assert(current_last_seq_ <= versions_->LastSequence());
 
   current_batch_ = std::move(batch);
+  current_batch_wal_file_number_ = current_record_wal_file_number_;
+  current_batch_wal_record_offset_ = current_record_wal_record_offset_;
+  current_batch_wal_record_end_ = current_record_wal_record_end_;
+  current_batch_wal_record_checksum_ = current_record_wal_record_checksum_;
   is_valid_ = true;
   current_status_ = Status::OK();
 }

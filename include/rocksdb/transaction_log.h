@@ -62,6 +62,20 @@ using LogFile = WalFile;
 
 struct BatchResult {
   SequenceNumber sequence = 0;
+
+  // The WAL file number containing this batch. Together with
+  // wal_record_offset, this identifies the batch while the WAL is retained.
+  uint64_t wal_file_number = 0;
+
+  // The physical byte offset of the first fragment of this logical WAL record.
+  uint64_t wal_record_offset = 0;
+
+  // The first physical byte offset after this logical WAL record.
+  uint64_t wal_record_end = 0;
+
+  // XXH3 checksum of the logical WAL record contents.
+  uint64_t wal_record_checksum = 0;
+
   std::unique_ptr<WriteBatch> writeBatchPtr;
 
   // Add empty __ctor and __dtor for the rule of five
@@ -75,12 +89,23 @@ struct BatchResult {
 
   BatchResult& operator=(const BatchResult&) = delete;
 
-  BatchResult(BatchResult&& bResult)
-      : sequence(std::move(bResult.sequence)),
+  BatchResult(BatchResult&& bResult) noexcept
+      : sequence(bResult.sequence),
+        wal_file_number(bResult.wal_file_number),
+        wal_record_offset(bResult.wal_record_offset),
+        wal_record_end(bResult.wal_record_end),
+        wal_record_checksum(bResult.wal_record_checksum),
         writeBatchPtr(std::move(bResult.writeBatchPtr)) {}
 
-  BatchResult& operator=(BatchResult&& bResult) {
-    sequence = std::move(bResult.sequence);
+  BatchResult& operator=(BatchResult&& bResult) noexcept {
+    if (this == &bResult) {
+      return *this;
+    }
+    sequence = bResult.sequence;
+    wal_file_number = bResult.wal_file_number;
+    wal_record_offset = bResult.wal_record_offset;
+    wal_record_end = bResult.wal_record_end;
+    wal_record_checksum = bResult.wal_record_checksum;
     writeBatchPtr = std::move(bResult.writeBatchPtr);
     return *this;
   }
@@ -99,12 +124,13 @@ class TransactionLogIterator {
   // Can read data from a valid iterator.
   virtual bool Valid() = 0;
 
-  // Moves the iterator to the next WriteBatch.
-  // REQUIRES: Valid() to be true.
+  // Moves the iterator to the next WriteBatch. At a clean WAL tail, callers
+  // may append more writes and call Next() again to continue tailing.
+  // REQUIRES: Valid() is true, or Valid() is false and status() is OK.
   virtual void Next() = 0;
 
-  // Returns ok if the iterator is valid.
-  // Returns the Error when something has gone wrong.
+  // Returns OK if the iterator is valid or stopped at a clean WAL tail.
+  // Returns the error when something has gone wrong.
   virtual Status status() = 0;
 
   // If valid return's the current write_batch and the sequence number of the

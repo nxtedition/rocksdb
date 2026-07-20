@@ -11,6 +11,9 @@
 // in Release build.
 // which is a pity, it is a good test
 
+#include <atomic>
+#include <thread>
+
 #include "db/db_test_util.h"
 #include "env/mock_env.h"
 #include "port/stack_trace.h"
@@ -332,6 +335,185 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorBlobs) {
       "Delete(0, key2)",
       handler.seen);
 }
+
+TEST_F(DBTestXactLogIterator,
+       TransactionLogIteratorLogDataOnlyTailAndWalPosition) {
+  Options options = OptionsForLogIterTest();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+
+  auto iter = OpenTransactionLogIter(0);
+  BatchResult initial = iter->GetBatch();
+  ASSERT_EQ(initial.writeBatchPtr->Count(), 1U);
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  WriteBatch first_log_data;
+  ASSERT_OK(first_log_data.PutLogData(Slice("log-data-1")));
+  ASSERT_OK(dbfull()->Write(WriteOptions(), &first_log_data));
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  BatchResult first = iter->GetBatch();
+  ASSERT_EQ(first.sequence, 2U);
+  ASSERT_EQ(first.writeBatchPtr->Count(), 0U);
+  ASSERT_GT(first.wal_file_number, 0U);
+  ASSERT_LT(first.wal_record_offset, first.wal_record_end);
+
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  WriteBatch second_log_data;
+  ASSERT_OK(second_log_data.PutLogData(Slice("log-data-2")));
+  ASSERT_OK(dbfull()->Write(WriteOptions(), &second_log_data));
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  BatchResult second = iter->GetBatch();
+  ASSERT_EQ(second.sequence, 2U);
+  ASSERT_EQ(second.writeBatchPtr->Count(), 0U);
+  ASSERT_EQ(first.wal_file_number, second.wal_file_number);
+  ASSERT_LT(first.wal_record_offset, second.wal_record_offset);
+  ASSERT_LE(first.wal_record_end, second.wal_record_offset);
+  ASSERT_NE(first.wal_record_checksum, second.wal_record_checksum);
+
+  const uint64_t first_file_number = first.wal_file_number;
+  const uint64_t first_offset = first.wal_record_offset;
+  const uint64_t first_end = first.wal_record_end;
+  const uint64_t first_checksum = first.wal_record_checksum;
+  const uint64_t second_file_number = second.wal_file_number;
+  const uint64_t second_offset = second.wal_record_offset;
+  const uint64_t second_end = second.wal_record_end;
+  const uint64_t second_checksum = second.wal_record_checksum;
+
+  BatchResult move_constructed(std::move(first));
+  ASSERT_EQ(move_constructed.wal_file_number, first_file_number);
+  ASSERT_EQ(move_constructed.wal_record_offset, first_offset);
+  ASSERT_EQ(move_constructed.wal_record_end, first_end);
+  ASSERT_EQ(move_constructed.wal_record_checksum, first_checksum);
+
+  BatchResult moved;
+  moved = std::move(second);
+  ASSERT_EQ(moved.wal_file_number, second_file_number);
+  ASSERT_EQ(moved.wal_record_offset, second_offset);
+  ASSERT_EQ(moved.wal_record_end, second_end);
+  ASSERT_EQ(moved.wal_record_checksum, second_checksum);
+
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 1U);
+
+  auto replay = OpenTransactionLogIter(0);
+  ASSERT_EQ(replay->GetBatch().writeBatchPtr->Count(), 1U);
+  replay->Next();
+  ASSERT_TRUE(replay->Valid());
+  BatchResult replay_first = replay->GetBatch();
+  ASSERT_EQ(replay_first.wal_file_number, first_file_number);
+  ASSERT_EQ(replay_first.wal_record_offset, first_offset);
+  ASSERT_EQ(replay_first.wal_record_end, first_end);
+  ASSERT_EQ(replay_first.wal_record_checksum, first_checksum);
+
+  replay->Next();
+  ASSERT_TRUE(replay->Valid());
+  BatchResult replay_second = replay->GetBatch();
+  ASSERT_EQ(replay_second.wal_file_number, second_file_number);
+  ASSERT_EQ(replay_second.wal_record_offset, second_offset);
+  ASSERT_EQ(replay_second.wal_record_end, second_end);
+  ASSERT_EQ(replay_second.wal_record_checksum, second_checksum);
+  replay->Next();
+  ASSERT_FALSE(replay->Valid());
+  ASSERT_OK(replay->status());
+}
+
+TEST_F(DBTestXactLogIterator,
+       TransactionLogIteratorLogDataOnlyAtInitialSequence) {
+  Options options = OptionsForLogIterTest();
+  DestroyAndReopen(options);
+
+  WriteBatch first_log_data;
+  ASSERT_OK(first_log_data.PutLogData(Slice("log-data-1")));
+  ASSERT_OK(dbfull()->Write(WriteOptions(), &first_log_data));
+  WriteBatch second_log_data;
+  ASSERT_OK(second_log_data.PutLogData(Slice("log-data-2")));
+  ASSERT_OK(dbfull()->Write(WriteOptions(), &second_log_data));
+  ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 0U);
+
+  auto iter = OpenTransactionLogIter(0);
+  BatchResult first = iter->GetBatch();
+  ASSERT_EQ(first.sequence, 1U);
+  ASSERT_EQ(first.writeBatchPtr->Count(), 0U);
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  BatchResult second = iter->GetBatch();
+  ASSERT_EQ(second.sequence, 1U);
+  ASSERT_EQ(second.writeBatchPtr->Count(), 0U);
+  ASSERT_EQ(first.wal_file_number, second.wal_file_number);
+  ASSERT_LT(first.wal_record_offset, second.wal_record_offset);
+  ASSERT_NE(first.wal_record_checksum, second.wal_record_checksum);
+
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+#ifndef NDEBUG
+TEST_F(DBTestXactLogIterator,
+       TransactionLogIteratorDoesNotExposeUnpublishedConsumingBatch) {
+  Options options = OptionsForLogIterTest();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+
+  auto iter = OpenTransactionLogIter(0);
+  ASSERT_EQ(iter->GetBatch().writeBatchPtr->Count(), 1U);
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  std::atomic<bool> wal_written{false};
+  std::atomic<bool> allow_publish{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteImpl:AfterWriteWAL", [&](void*) {
+        wal_written.store(true, std::memory_order_release);
+        while (!allow_publish.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status write_status;
+  std::thread writer([&]() { write_status = Put("key2", "value2"); });
+  while (!wal_written.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  iter->Next();
+  const bool exposed_before_publish = iter->Valid();
+  const Status status_before_publish = iter->status();
+
+  allow_publish.store(true, std::memory_order_release);
+  writer.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(write_status);
+  ASSERT_FALSE(exposed_before_publish);
+  ASSERT_OK(status_before_publish);
+  ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 2U);
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  BatchResult published = iter->GetBatch();
+  ASSERT_EQ(published.sequence, 2U);
+  ASSERT_EQ(published.writeBatchPtr->Count(), 1U);
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+#endif
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

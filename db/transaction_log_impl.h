@@ -109,8 +109,32 @@ class TransactionLogIteratorImpl : public TransactionLogIterator {
   SequenceNumber
       current_batch_seq_;  // sequence number at start of current batch
   SequenceNumber current_last_seq_;  // last sequence in the current batch
-  // Reads from transaction log only if the writebatch record has been written
+  uint64_t current_batch_wal_file_number_;
+  uint64_t current_batch_wal_record_offset_;
+  uint64_t current_batch_wal_record_end_;
+  uint64_t current_batch_wal_record_checksum_;
+
+  // Metadata for the record most recently returned by RestrictedRead().
+  uint64_t current_record_wal_file_number_;
+  uint64_t current_record_wal_record_offset_;
+  uint64_t current_record_wal_record_end_;
+  uint64_t current_record_wal_record_checksum_;
+
+  // A complete consuming record can reach the WAL before its ending sequence
+  // is published. Keep it here so a later Next() can return it without either
+  // exposing it early or losing the reader position.
+  bool has_unpublished_record_;
+  std::string unpublished_record_;
+  uint64_t unpublished_record_wal_file_number_;
+  uint64_t unpublished_record_wal_record_offset_;
+  uint64_t unpublished_record_wal_record_end_;
+  uint64_t unpublished_record_wal_record_checksum_;
+
+  // Reads the next complete transaction-log record. Zero-count records are
+  // immediately visible. Consuming records are returned only after their
+  // ending sequence has been published.
   bool RestrictedRead(Slice* record);
+  bool IsRecordPublished(const Slice& record) const;
   // Seeks to starting_sequence_number_ reading from start_file_index in files_.
   // If strict is set, then must get a batch starting with
   // starting_sequence_number_.
