@@ -12,12 +12,14 @@
 // which is a pity, it is a good test
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "db/db_test_util.h"
 #include "env/mock_env.h"
 #include "port/stack_trace.h"
 #include "util/atomic.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -27,9 +29,11 @@ class DBTestXactLogIterator : public DBTestBase {
       : DBTestBase("db_log_iter_test", /*env_do_fsync=*/true) {}
 
   std::unique_ptr<TransactionLogIterator> OpenTransactionLogIter(
-      const SequenceNumber seq) {
+      const SequenceNumber seq, const bool include_wal_record_checksum = false) {
     std::unique_ptr<TransactionLogIterator> iter;
-    Status status = dbfull()->GetUpdatesSince(seq, &iter);
+    TransactionLogIterator::ReadOptions read_options;
+    read_options.include_wal_record_checksum_ = include_wal_record_checksum;
+    Status status = dbfull()->GetUpdatesSince(seq, &iter, read_options);
     EXPECT_OK(status);
     EXPECT_TRUE(iter->Valid());
     return iter;
@@ -342,7 +346,10 @@ TEST_F(DBTestXactLogIterator,
   DestroyAndReopen(options);
   ASSERT_OK(Put("key1", "value1"));
 
-  auto iter = OpenTransactionLogIter(0);
+  auto default_iter = OpenTransactionLogIter(0);
+  ASSERT_EQ(default_iter->GetBatch().wal_record_checksum, 0U);
+
+  auto iter = OpenTransactionLogIter(0, true);
   BatchResult initial = iter->GetBatch();
   ASSERT_EQ(initial.writeBatchPtr->Count(), 1U);
   iter->Next();
@@ -406,7 +413,7 @@ TEST_F(DBTestXactLogIterator,
   ASSERT_OK(iter->status());
   ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 1U);
 
-  auto replay = OpenTransactionLogIter(0);
+  auto replay = OpenTransactionLogIter(0, true);
   ASSERT_EQ(replay->GetBatch().writeBatchPtr->Count(), 1U);
   replay->Next();
   ASSERT_TRUE(replay->Valid());
@@ -441,7 +448,7 @@ TEST_F(DBTestXactLogIterator,
   ASSERT_OK(dbfull()->Write(WriteOptions(), &second_log_data));
   ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 0U);
 
-  auto iter = OpenTransactionLogIter(0);
+  auto iter = OpenTransactionLogIter(0, true);
   BatchResult first = iter->GetBatch();
   ASSERT_EQ(first.sequence, 1U);
   ASSERT_EQ(first.writeBatchPtr->Count(), 0U);
@@ -475,20 +482,40 @@ TEST_F(DBTestXactLogIterator,
 
   std::atomic<bool> wal_written{false};
   std::atomic<bool> allow_publish{false};
+  std::atomic<bool> publish_wait_timed_out{false};
+  std::thread writer;
+  Defer cleanup([&]() {
+    allow_publish.store(true, std::memory_order_release);
+    if (writer.joinable()) {
+      writer.join();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::WriteImpl:AfterWriteWAL", [&](void*) {
         wal_written.store(true, std::memory_order_release);
-        while (!allow_publish.load(std::memory_order_acquire)) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!allow_publish.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
           std::this_thread::yield();
         }
+        publish_wait_timed_out.store(
+            !allow_publish.load(std::memory_order_acquire),
+            std::memory_order_release);
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
   Status write_status;
-  std::thread writer([&]() { write_status = Put("key2", "value2"); });
-  while (!wal_written.load(std::memory_order_acquire)) {
+  writer = std::thread([&]() { write_status = Put("key2", "value2"); });
+  const auto wal_write_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!wal_written.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < wal_write_deadline) {
     std::this_thread::yield();
   }
+  ASSERT_TRUE(wal_written.load(std::memory_order_acquire));
 
   iter->Next();
   const bool exposed_before_publish = iter->Valid();
@@ -496,10 +523,9 @@ TEST_F(DBTestXactLogIterator,
 
   allow_publish.store(true, std::memory_order_release);
   writer.join();
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
 
   ASSERT_OK(write_status);
+  ASSERT_FALSE(publish_wait_timed_out.load(std::memory_order_acquire));
   ASSERT_FALSE(exposed_before_publish);
   ASSERT_OK(status_before_publish);
   ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 2U);

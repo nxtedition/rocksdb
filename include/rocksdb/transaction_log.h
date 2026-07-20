@@ -73,7 +73,8 @@ struct BatchResult {
   // The first physical byte offset after this logical WAL record.
   uint64_t wal_record_end = 0;
 
-  // XXH3 checksum of the logical WAL record contents.
+  // XXH3 checksum of the logical WAL record contents, or zero when
+  // ReadOptions::include_wal_record_checksum_ is false.
   uint64_t wal_record_checksum = 0;
 
   std::unique_ptr<WriteBatch> writeBatchPtr;
@@ -145,10 +146,16 @@ class TransactionLogIterator {
     // Default: true
     bool verify_checksums_;
 
-    ReadOptions() : verify_checksums_(true) {}
+    // If true, calculate and populate BatchResult::wal_record_checksum.
+    // Default: false
+    bool include_wal_record_checksum_;
+
+    ReadOptions()
+        : verify_checksums_(true), include_wal_record_checksum_(false) {}
 
     explicit ReadOptions(bool verify_checksums)
-        : verify_checksums_(verify_checksums) {}
+        : verify_checksums_(verify_checksums),
+          include_wal_record_checksum_(false) {}
   };
 };
 }  // namespace ROCKSDB_NAMESPACE

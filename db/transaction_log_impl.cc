@@ -107,7 +107,8 @@ bool TransactionLogIteratorImpl::IsRecordPublished(const Slice& record) const {
     return true;
   }
 
-  const uint64_t count = DecodeFixed32(record.data() + 8);
+  const uint64_t count =
+      DecodeFixed32(record.data() + sizeof(SequenceNumber));
   if (count == 0) {
     return true;
   }
@@ -139,7 +140,8 @@ bool TransactionLogIteratorImpl::RestrictedRead(Slice* record) {
   uint64_t record_checksum = 0;
   if (!current_log_reader_->ReadRecord(
           record, &scratch_, WALRecoveryMode::kTolerateCorruptedTailRecords,
-          &record_checksum)) {
+          read_options_.include_wal_record_checksum_ ? &record_checksum
+                                                     : nullptr)) {
     return false;
   }
 
